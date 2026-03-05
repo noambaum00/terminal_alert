@@ -48,7 +48,7 @@ CATEGORY_LABELS = {
     "3": "🌍 Earthquake",
     "4": "☣️  Hazardous Materials",
     "5": "🌊 Tsunami",
-    "6": "🔫 Terrorist Incursion",
+    "6": "✈️  Hostile Aircraft Intrusion",
     "7": "☢️  Unconventional Missile",
     "13": "☢️  Radiological Event",
 }
@@ -154,15 +154,17 @@ def make_session_history_table(session_history: deque) -> Panel:
     table.add_column("Time", style="dim", width=19, no_wrap=True)
     table.add_column("Category", style="bright_red", min_width=24)
     table.add_column("Areas", style="yellow")
+    table.add_column("Description", style="dim yellow")
 
     if not session_history:
-        table.add_row("—", "No alerts recorded yet", "—")
+        table.add_row("—", "No alerts recorded yet", "—", "—")
     else:
         for entry in reversed(session_history):
             table.add_row(
                 entry["time"],
                 entry["category"],
                 entry["areas"],
+                entry.get("desc", ""),
             )
 
     return Panel(
