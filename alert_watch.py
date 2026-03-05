@@ -12,14 +12,18 @@ Press  q  or  Ctrl-C  to quit.
 """
 
 import argparse
+import asyncio
 import json
+import queue
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 
 import requests
+import websockets
 from rich.align import Align
 from rich.console import Console
 from rich.layout import Layout
@@ -34,6 +38,7 @@ from rich import box
 # ---------------------------------------------------------------------------
 ALERTS_URL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
 HISTORY_URL = "https://api.tzevaadom.co.il/alerts-history/"
+WS_URL = "wss://ws.tzevaadom.co.il/socket?platform=WEB"
 
 HEADERS = {
     "Referer": "https://www.oref.org.il/",
@@ -46,6 +51,38 @@ MAX_HISTORY = 50
 
 # Default shelter time (seconds) when a city is not found in cities.json
 DEFAULT_EVAC_TIME = 90
+
+# ---------------------------------------------------------------------------
+# WebSocket listener
+# ---------------------------------------------------------------------------
+
+# Thread-safe queue shared between the background WebSocket thread and the main loop
+_ws_queue: queue.Queue = queue.Queue()
+
+
+async def _ws_listen() -> None:
+    """Connect to the tzevaadom WebSocket and forward JSON payloads to *_ws_queue*.
+
+    Automatically reconnects with a 5-second back-off on any error.
+    """
+    while True:
+        try:
+            async with websockets.connect(WS_URL) as ws:
+                while True:
+                    raw = await ws.recv()
+                    try:
+                        _ws_queue.put_nowait(json.loads(raw))
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            # Connection errors are expected (network hiccups, server restarts).
+            # Silently retry after a brief back-off so the listener never crashes.
+            await asyncio.sleep(5)
+
+
+def _start_ws_listener() -> None:
+    """Spawn a daemon thread that runs the asyncio WebSocket listener."""
+    threading.Thread(target=lambda: asyncio.run(_ws_listen()), daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Category system (tzevaadom threat codes 0-7)
@@ -321,12 +358,16 @@ def make_warning_overlay(
     matching_cities: list[str],
     city_data: dict,
     areas: dict[int, str],
+    threat_override: int | None = None,
 ) -> Panel:
     """Full-screen warning panel shown when a watched locality is under alert."""
-    cat = str(alert.get("cat", ""))
-    threat = OREF_CAT_TO_THREAT.get(cat, 0)
+    if threat_override is not None:
+        threat = threat_override
+    else:
+        cat = str(alert.get("cat", ""))
+        threat = OREF_CAT_TO_THREAT.get(cat, 0)
     color = CATEGORY_COLORS.get(threat, "#FF0000")
-    cat_label = CATEGORY_LABELS.get(threat, f"Category {cat}")
+    cat_label = CATEGORY_LABELS.get(threat, f"Threat {threat}")
     title_he = alert.get("title", "")
 
     # Shortest evac_time among the matched cities (fall back to DEFAULT_EVAC_TIME)
@@ -412,6 +453,67 @@ def run(interval: int, watch_cities: list[str]) -> None:
     # Initial history fetch
     server_history: list[dict] = fetch_history()
 
+    # Start real-time WebSocket listener in a background daemon thread
+    _start_ws_listener()
+
+    def _drain_ws_events() -> tuple[list[str], int]:
+        """Drain *_ws_queue* and process all pending events.
+
+        * ``ALERT``          – appended to *session_history*; if any city in the
+                               alert matches *watch_cities*, returns the matched
+                               subset together with the threat code.
+        * ``SYSTEM_MESSAGE`` – appended to *session_history* with a 📡 marker.
+
+        Returns ``(matched_cities, threat_code)``.  Both are empty / 0 when no
+        watched locality was involved.
+        """
+        matched: list[str] = []
+        matched_threat: int = 0
+        while True:
+            try:
+                event = _ws_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            msg_type = event.get("type")
+            data = event.get("data") or {}
+
+            if msg_type == "ALERT":
+                cities: list[str] = data.get("cities", [])
+                threat: int = data.get("threat", 0)
+                is_drill: bool = data.get("isDrill", False)
+                color = CATEGORY_COLORS.get(threat, "#FF0000")
+                label = CATEGORY_LABELS.get(threat, f"Threat {threat}")
+                session_history.append(
+                    {
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "category": ("[DRILL] " if is_drill else "") + label,
+                        "color": color,
+                        "areas": ", ".join(cities),
+                        "desc": "",
+                    }
+                )
+                if not is_drill and watch_cities:
+                    mc = [c for c in watch_cities if c in cities]
+                    if mc:
+                        matched = mc
+                        matched_threat = threat
+
+            elif msg_type == "SYSTEM_MESSAGE":
+                title = data.get("titleEn") or data.get("titleHe") or "System"
+                body = data.get("bodyEn") or data.get("bodyHe") or ""
+                session_history.append(
+                    {
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "category": "📡 System",
+                        "color": "#00FFFF",
+                        "areas": title,
+                        "desc": body,
+                    }
+                )
+
+        return matched, matched_threat
+
     with Live(console=console, screen=True, refresh_per_second=1) as live:
         while True:
             poll_count += 1
@@ -439,18 +541,42 @@ def run(interval: int, watch_cities: list[str]) -> None:
             else:
                 last_alert_id = None
 
+            # Process WebSocket events that arrived since the last poll
+            ws_matched, ws_threat = _drain_ws_events()
+
             # Decide what to display this cycle
             matching = get_matching_cities(current_alert, watch_cities)
 
             if matching:
-                # ── Full-screen warning overlay for watched localities ──────
+                # ── Full-screen warning overlay for watched localities (OREF) ─
                 overlay = make_warning_overlay(current_alert, matching, city_data, areas)
                 ticks = interval * 4
                 for _ in range(ticks):
+                    # Drain the queue so session_history stays current; the
+                    # overlay is already visible so any simultaneous WS match
+                    # will simply be picked up on the next outer-loop iteration.
+                    _drain_ws_events()
                     live.update(overlay)
                     time.sleep(0.25)
+            elif ws_matched:
+                # ── Full-screen warning overlay triggered by WebSocket alert ──
+                ws_overlay = make_warning_overlay(
+                    {},
+                    ws_matched,
+                    city_data,
+                    areas,
+                    threat_override=ws_threat,
+                )
+                ticks = interval * 4
+                for _ in range(ticks):
+                    # Continue draining the queue so session_history stays
+                    # current; a second simultaneous WS match will be handled
+                    # on the next outer-loop iteration.
+                    _drain_ws_events()
+                    live.update(ws_overlay)
+                    time.sleep(0.25)
             else:
-                # ── Normal dashboard layout ───────────────────────────────
+                # ── Normal dashboard layout ───────────────────────────────────
                 layout = build_layout(
                     poll_count=poll_count,
                     now=datetime.now(),
@@ -463,9 +589,15 @@ def run(interval: int, watch_cities: list[str]) -> None:
                 # Tick every 0.25 s so only the clock panel is refreshed between polls
                 ticks = interval * 4
                 for _ in range(ticks):
+                    ws_new, ws_new_threat = _drain_ws_events()
                     layout["header"].update(make_header(poll_count, datetime.now(), interval))
                     live.update(layout)
                     time.sleep(0.25)
+                    # If a WS alert just matched a watched city, break out
+                    # immediately so the overlay is shown on the next iteration
+                    if ws_new:
+                        ws_matched, ws_threat = ws_new, ws_new_threat
+                        break
 
 
 def main() -> None:
