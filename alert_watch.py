@@ -294,13 +294,14 @@ def make_server_history_table(history_groups: list[dict]) -> Panel:
         for alert in group.get("alerts", []):
             if not alert.get("isDrill"):
                 flat.append(alert)
-    flat.sort(key=lambda a: a.get("time", 0), reverse=True)
+    flat.sort(key=lambda a: a.get("time") or 0, reverse=True)
 
     if not flat:
         table.add_row("—", "No history available", "—")
     else:
         for alert in flat[:20]:
-            ts = datetime.fromtimestamp(alert["time"]).strftime("%Y-%m-%d %H:%M:%S")
+            raw_time = alert.get("time")
+            ts = datetime.fromtimestamp(raw_time).strftime("%Y-%m-%d %H:%M:%S") if raw_time else "—"
             threat = alert.get("threat", 0)
             color = CATEGORY_COLORS.get(threat, "#FF0000")
             label = CATEGORY_LABELS.get(threat, f"Threat {threat}")
@@ -328,11 +329,12 @@ def make_warning_overlay(
     cat_label = CATEGORY_LABELS.get(threat, f"Category {cat}")
     title_he = alert.get("title", "")
 
-    # Shortest evac_time among the matched cities (fall back to 90 s)
+    # Shortest evac_time among the matched cities (fall back to DEFAULT_EVAC_TIME)
+    # Use "is not None" so evac_time=0 (shelter immediately) is included correctly
     evac_times = [
         city_data[c]["evac_time"]
         for c in matching_cities
-        if c in city_data and city_data[c].get("evac_time")
+        if c in city_data and city_data[c].get("evac_time") is not None
     ]
     evac_time = min(evac_times) if evac_times else DEFAULT_EVAC_TIME
     instructions_tmpl = CATEGORY_INSTRUCTIONS.get(threat, "היכנסו מיד למרחב המוגן!")
