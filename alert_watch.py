@@ -12,10 +12,12 @@ Press  q  or  Ctrl-C  to quit.
 """
 
 import argparse
+import json
 import sys
 import time
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 import requests
 from rich.align import Align
@@ -28,11 +30,9 @@ from rich.text import Text
 from rich import box
 
 # ---------------------------------------------------------------------------
-# OREF API endpoints
+# OREF API endpoint  (only the live-alerts feed is used)
 # ---------------------------------------------------------------------------
 ALERTS_URL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
-HISTORY_URL = "https://www.oref.org.il/WarningMessages/alert/alertsHistory.json"
-CITIES_URL = "https://www.oref.org.il/Shared/Ajax/GetCitiesMix.aspx?lang=he"
 
 HEADERS = {
     "Referer": "https://www.oref.org.il/",
@@ -89,33 +89,20 @@ def fetch_current_alert(timeout: int = 5) -> dict | None:
         return None
 
 
-def fetch_history(timeout: int = 5) -> list[dict]:
-    """Return the server-side alert history list (may be empty)."""
-    try:
-        resp = requests.get(HISTORY_URL, headers=HEADERS, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        if isinstance(data, list):
-            return data
-        return []
-    except requests.RequestException:
-        return []
-
-
-def fetch_cities(timeout: int = 10) -> dict[str, dict]:
-    """Fetch the OREF city/locality list.
+def fetch_cities() -> dict[str, dict]:
+    """Load the bundled list of Israeli localities from *cities.json*.
 
     Returns a dict mapping Hebrew city name → city record
     (which includes ``migun_time`` in seconds and ``areaname``).
     """
+    cities_file = Path(__file__).parent / "cities.json"
     try:
-        resp = requests.get(CITIES_URL, headers=HEADERS, timeout=timeout)
-        resp.raise_for_status()
-        cities = resp.json()
+        with open(cities_file, encoding="utf-8") as fh:
+            cities = json.load(fh)
         if isinstance(cities, list):
             return {c["value"]: c for c in cities if "value" in c}
         return {}
-    except (requests.RequestException, ValueError):
+    except (OSError, ValueError):
         return {}
 
 
@@ -225,36 +212,6 @@ def make_session_history_table(session_history: deque) -> Panel:
     )
 
 
-def make_server_history_table(server_history: list[dict]) -> Panel:
-    table = Table(
-        box=box.SIMPLE_HEAVY,
-        show_header=True,
-        header_style="bold magenta",
-        expand=True,
-        show_lines=False,
-    )
-    table.add_column("Time", style="dim", width=19, no_wrap=True)
-    table.add_column("Category", style="bright_red", min_width=24)
-    table.add_column("Areas", style="yellow")
-
-    if not server_history:
-        table.add_row("—", "No server history available", "—")
-    else:
-        for entry in server_history[:20]:
-            cat = str(entry.get("cat", ""))
-            cat_label = CATEGORY_LABELS.get(cat, f"Cat {cat}")
-            areas = ", ".join(entry.get("data", []))
-            ts = entry.get("alertDate", entry.get("date", ""))
-            table.add_row(ts or "—", cat_label, areas or "—")
-
-    return Panel(
-        table,
-        title="[bold magenta]Server Alert History (last 20)[/bold magenta]",
-        border_style="magenta",
-        box=box.ROUNDED,
-    )
-
-
 def make_warning_overlay(
     alert: dict,
     matching_cities: list[str],
@@ -306,25 +263,18 @@ def build_layout(
     interval: int,
     current_alert: dict | None,
     session_history: deque,
-    server_history: list[dict],
 ) -> Layout:
     layout = Layout()
 
     layout.split_column(
         Layout(name="header", size=5),
         Layout(name="alert", size=10),
-        Layout(name="body"),
-    )
-
-    layout["body"].split_row(
         Layout(name="session_hist"),
-        Layout(name="server_hist"),
     )
 
     layout["header"].update(make_header(poll_count, now, interval))
     layout["alert"].update(make_alert_panel(current_alert))
     layout["session_hist"].update(make_session_history_table(session_history))
-    layout["server_hist"].update(make_server_history_table(server_history))
 
     return layout
 
@@ -338,13 +288,9 @@ def run(interval: int, watch_cities: list[str]) -> None:
     session_history: deque = deque(maxlen=MAX_HISTORY)
     last_alert_id: str | None = None
     poll_count = 0
-    server_history: list[dict] = []
 
-    # Fetch city data for shelter-time lookup (only if filtering is active)
+    # Load city data for shelter-time lookup (only needed when filtering is active)
     city_data: dict = fetch_cities() if watch_cities else {}
-
-    # Initial server history fetch
-    server_history = fetch_history()
 
     with Live(console=console, screen=True, refresh_per_second=1) as live:
         while True:
@@ -366,8 +312,6 @@ def run(interval: int, watch_cities: list[str]) -> None:
                             "desc": current_alert.get("desc", ""),
                         }
                     )
-                    # Refresh server history when a new alert fires
-                    server_history = fetch_history()
             else:
                 last_alert_id = None
 
@@ -389,7 +333,6 @@ def run(interval: int, watch_cities: list[str]) -> None:
                     interval=interval,
                     current_alert=current_alert,
                     session_history=session_history,
-                    server_history=server_history,
                 )
 
                 # Tick every 0.25 s so only the clock panel is refreshed between polls
@@ -441,10 +384,9 @@ def main() -> None:
 
     # ── --list-cities mode ─────────────────────────────────────────────────
     if args.list_cities:
-        print("Fetching city list from OREF…")
         city_data = fetch_cities()
         if not city_data:
-            print("Error: could not fetch city list.", file=sys.stderr)
+            print("Error: cities.json not found next to alert_watch.py.", file=sys.stderr)
             sys.exit(1)
         print(f"{'Locality':<40}  {'Area':<30}  Shelter (s)")
         print("-" * 80)
