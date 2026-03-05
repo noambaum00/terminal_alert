@@ -20,6 +20,22 @@ A **ctop-style full-screen terminal dashboard** that watches for Israel Home Fro
 
 ## Installation
 
+### 🍺 Homebrew (macOS — recommended)
+
+```bash
+brew tap noambaum00/terminal_alert https://github.com/noambaum00/terminal_alert
+brew install --HEAD terminal-alert
+```
+
+After installation the `terminal-alert` command is available system-wide:
+
+```bash
+terminal-alert
+terminal-alert --interval 10
+```
+
+### pip (manual)
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -27,12 +43,12 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Default: poll every 5 seconds
+# Default: poll every 30 seconds
 python3 alert_watch.py
 
-# Custom interval (e.g. every 3 seconds)
-python3 alert_watch.py --interval 3
-python3 alert_watch.py -i 3
+# Custom interval (e.g. every 10 seconds)
+python3 alert_watch.py --interval 10
+python3 alert_watch.py -i 10
 ```
 
 Press **Ctrl-C** to exit.
