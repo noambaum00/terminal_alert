@@ -6,7 +6,7 @@ and displays rocket/missile/threat alerts in real time.
 
 Usage:
     python3 alert_watch.py
-    python3 alert_watch.py --interval 3   # poll every 3 seconds (default: 5)
+    python3 alert_watch.py --interval 30   # poll every 30 seconds (default: 30)
 
 Press  q  or  Ctrl-C  to quit.
 """
@@ -92,14 +92,25 @@ def fetch_history(timeout: int = 5) -> list[dict]:
 # UI helpers
 # ---------------------------------------------------------------------------
 
-def make_header(poll_count: int, last_update: str, interval: int) -> Panel:
-    title = Text("🇮🇱  Israel Home Front Command — Live Alert Monitor", style="bold white")
-    subtitle = Text(
-        f"  Polling every {interval}s  │  Polls: {poll_count}  │  Last update: {last_update}  │  [dim]q / Ctrl-C to quit[/dim]",
-        style="dim cyan",
+def make_header(poll_count: int, now: datetime, interval: int) -> Panel:
+    left = Text.assemble(
+        Text("🇮🇱  Israel Home Front Command — Live Alert Monitor\n", style="bold white"),
+        Text(
+            f"  Polling every {interval}s  │  Polls: {poll_count}"
+            f"  │  Last fetch: {now.strftime('%Y-%m-%d %H:%M:%S')}"
+            f"  │  [dim]q / Ctrl-C to quit[/dim]",
+            style="dim cyan",
+        ),
     )
-    combined = Text.assemble(title, "\n", subtitle)
-    return Panel(combined, style="bold blue", box=box.HEAVY)
+    clock = Text.assemble(
+        Text(now.strftime("%H:%M:%S") + "\n", style="bold bright_white"),
+        Text(now.strftime("%Y-%m-%d"), style="dim cyan"),
+    )
+    grid = Table.grid(expand=True)
+    grid.add_column(ratio=4)
+    grid.add_column(justify="right", ratio=1)
+    grid.add_row(left, clock)
+    return Panel(grid, style="bold blue", box=box.HEAVY)
 
 
 def make_alert_panel(alert: dict | None) -> Panel:
@@ -207,7 +218,7 @@ def make_server_history_table(server_history: list[dict]) -> Panel:
 
 def build_layout(
     poll_count: int,
-    last_update: str,
+    now: datetime,
     interval: int,
     current_alert: dict | None,
     session_history: deque,
@@ -226,7 +237,7 @@ def build_layout(
         Layout(name="server_hist"),
     )
 
-    layout["header"].update(make_header(poll_count, last_update, interval))
+    layout["header"].update(make_header(poll_count, now, interval))
     layout["alert"].update(make_alert_panel(current_alert))
     layout["session_hist"].update(make_session_history_table(session_history))
     layout["server_hist"].update(make_server_history_table(server_history))
@@ -248,10 +259,9 @@ def run(interval: int) -> None:
     # Initial server history fetch
     server_history = fetch_history()
 
-    with Live(console=console, screen=True, refresh_per_second=2) as live:
+    with Live(console=console, screen=True, refresh_per_second=1) as live:
         while True:
             poll_count += 1
-            last_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             current_alert = fetch_current_alert()
 
@@ -263,9 +273,10 @@ def run(interval: int) -> None:
                     cat = str(current_alert.get("cat", ""))
                     session_history.append(
                         {
-                            "time": last_update,
+                            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                             "category": CATEGORY_LABELS.get(cat, f"Cat {cat}"),
                             "areas": ", ".join(current_alert.get("data", [])),
+                            "desc": current_alert.get("desc", ""),
                         }
                     )
                     # Refresh server history when a new alert fires
@@ -273,18 +284,21 @@ def run(interval: int) -> None:
             else:
                 last_alert_id = None
 
+            # Build the full layout once per poll (alert data, history tables, etc.)
             layout = build_layout(
                 poll_count=poll_count,
-                last_update=last_update,
+                now=datetime.now(),
                 interval=interval,
                 current_alert=current_alert,
                 session_history=session_history,
                 server_history=server_history,
             )
-            live.update(layout)
 
-            # Sleep in small increments so we can react to Ctrl-C quickly
-            for _ in range(interval * 4):
+            # Tick every 0.25 s so only the clock panel is refreshed between polls
+            ticks = interval * 4
+            for _ in range(ticks):
+                layout["header"].update(make_header(poll_count, datetime.now(), interval))
+                live.update(layout)
                 time.sleep(0.25)
 
 
@@ -300,9 +314,9 @@ def main() -> None:
         "--interval",
         "-i",
         type=int,
-        default=5,
+        default=30,
         metavar="SECONDS",
-        help="Polling interval in seconds (default: 5)",
+        help="Polling interval in seconds (default: 30)",
     )
     args = parser.parse_args()
 
