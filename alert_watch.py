@@ -18,6 +18,7 @@ from collections import deque
 from datetime import datetime
 
 import requests
+from rich.align import Align
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -31,6 +32,7 @@ from rich import box
 # ---------------------------------------------------------------------------
 ALERTS_URL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
 HISTORY_URL = "https://www.oref.org.il/WarningMessages/alert/alertsHistory.json"
+CITIES_URL = "https://www.oref.org.il/Shared/Ajax/GetCitiesMix.aspx?lang=he"
 
 HEADERS = {
     "Referer": "https://www.oref.org.il/",
@@ -51,6 +53,18 @@ CATEGORY_LABELS = {
     "6": "✈️  Hostile Aircraft Intrusion",
     "7": "☢️  Unconventional Missile",
     "13": "☢️  Radiological Event",
+}
+
+# Home Front Command shelter instructions per alert category (Hebrew)
+CATEGORY_INSTRUCTIONS = {
+    "1": "היכנסו מיד למרחב המוגן וישהו בו {time} שניות",
+    "2": "היכנסו מיד למרחב המוגן",
+    "3": "עמדו ליד קיר פנימי תחתון — הרחיקו מחלונות ומחפצים כבדים",
+    "4": "הישארו בבית, סגרו חלונות ודלתות והכניסו בעלי חיים",
+    "5": "התרחקו מיידית מהחוף לשטח גבוה",
+    "6": "היכנסו מיד למרחב המוגן",
+    "7": "היכנסו מיד למרחב המוגן וישהו בו 10 דקות",
+    "13": "הישארו בבית, סגרו חלונות ודלתות",
 }
 
 
@@ -86,6 +100,31 @@ def fetch_history(timeout: int = 5) -> list[dict]:
         return []
     except requests.RequestException:
         return []
+
+
+def fetch_cities(timeout: int = 10) -> dict[str, dict]:
+    """Fetch the OREF city/locality list.
+
+    Returns a dict mapping Hebrew city name → city record
+    (which includes ``migun_time`` in seconds and ``areaname``).
+    """
+    try:
+        resp = requests.get(CITIES_URL, headers=HEADERS, timeout=timeout)
+        resp.raise_for_status()
+        cities = resp.json()
+        if isinstance(cities, list):
+            return {c["value"]: c for c in cities if "value" in c}
+        return {}
+    except (requests.RequestException, ValueError):
+        return {}
+
+
+def get_matching_cities(alert: dict | None, watch_cities: list[str]) -> list[str]:
+    """Return the subset of *watch_cities* that appear in the alert's area list."""
+    if not alert or not watch_cities:
+        return []
+    alert_areas = {a.strip() for a in alert.get("data", [])}
+    return [c for c in watch_cities if c.strip() in alert_areas]
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +255,51 @@ def make_server_history_table(server_history: list[dict]) -> Panel:
     )
 
 
+def make_warning_overlay(
+    alert: dict,
+    matching_cities: list[str],
+    city_data: dict,
+) -> Panel:
+    """Full-screen warning panel shown when a watched locality is under alert."""
+    cat = str(alert.get("cat", ""))
+    cat_label = CATEGORY_LABELS.get(cat, f"Category {cat}")
+    title_he = alert.get("title", "")
+
+    # Resolve shelter time: use the shortest migun_time among the matching cities
+    migun_times = [
+        city_data[c]["migun_time"]
+        for c in matching_cities
+        if c in city_data and city_data[c].get("migun_time")
+    ]
+    migun_time = min(migun_times) if migun_times else 90
+    instructions_tmpl = CATEGORY_INSTRUCTIONS.get(cat, "היכנסו מיד למרחב המוגן!")
+    instructions = instructions_tmpl.format(time=migun_time)
+
+    content = Text(justify="center")
+    content.append("\n")
+    content.append("🚨  אזעקה פעילה  🚨\n", style="bold bright_red blink")
+    content.append(f"\n{cat_label}\n", style="bold bright_yellow")
+    if title_he:
+        content.append(f"{title_he}\n", style="yellow")
+    content.append("\n")
+    content.append("יישובים מעוקבים בסכנה:\n", style="bold white")
+    for city in matching_cities:
+        area = city_data.get(city, {}).get("areaname", "")
+        suffix = f"  ({area})" if area else ""
+        content.append(f"  📍 {city}{suffix}\n", style="bold bright_yellow")
+    content.append("\n")
+    content.append("📋 הנחיות פיקוד העורף:\n", style="bold cyan")
+    content.append(f"  {instructions}\n", style="bold bright_white")
+
+    return Panel(
+        Align.center(content, vertical="middle"),
+        title="[bold red blink]⚠   ALERT  —  אזעקה   ⚠[/bold red blink]",
+        border_style="bright_red",
+        box=box.DOUBLE_EDGE,
+        padding=(1, 4),
+    )
+
+
 def build_layout(
     poll_count: int,
     now: datetime,
@@ -249,12 +333,15 @@ def build_layout(
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run(interval: int) -> None:
+def run(interval: int, watch_cities: list[str]) -> None:
     console = Console()
     session_history: deque = deque(maxlen=MAX_HISTORY)
     last_alert_id: str | None = None
     poll_count = 0
     server_history: list[dict] = []
+
+    # Fetch city data for shelter-time lookup (only if filtering is active)
+    city_data: dict = fetch_cities() if watch_cities else {}
 
     # Initial server history fetch
     server_history = fetch_history()
@@ -284,22 +371,33 @@ def run(interval: int) -> None:
             else:
                 last_alert_id = None
 
-            # Build the full layout once per poll (alert data, history tables, etc.)
-            layout = build_layout(
-                poll_count=poll_count,
-                now=datetime.now(),
-                interval=interval,
-                current_alert=current_alert,
-                session_history=session_history,
-                server_history=server_history,
-            )
+            # Decide what to display this cycle
+            matching = get_matching_cities(current_alert, watch_cities)
 
-            # Tick every 0.25 s so only the clock panel is refreshed between polls
-            ticks = interval * 4
-            for _ in range(ticks):
-                layout["header"].update(make_header(poll_count, datetime.now(), interval))
-                live.update(layout)
-                time.sleep(0.25)
+            if matching:
+                # ── Full-screen warning overlay for watched localities ──────
+                overlay = make_warning_overlay(current_alert, matching, city_data)
+                ticks = interval * 4
+                for _ in range(ticks):
+                    live.update(overlay)
+                    time.sleep(0.25)
+            else:
+                # ── Normal dashboard layout ───────────────────────────────
+                layout = build_layout(
+                    poll_count=poll_count,
+                    now=datetime.now(),
+                    interval=interval,
+                    current_alert=current_alert,
+                    session_history=session_history,
+                    server_history=server_history,
+                )
+
+                # Tick every 0.25 s so only the clock panel is refreshed between polls
+                ticks = interval * 4
+                for _ in range(ticks):
+                    layout["header"].update(make_header(poll_count, datetime.now(), interval))
+                    live.update(layout)
+                    time.sleep(0.25)
 
 
 def main() -> None:
@@ -318,16 +416,54 @@ def main() -> None:
         metavar="SECONDS",
         help="Polling interval in seconds (default: 30)",
     )
+    parser.add_argument(
+        "--cities",
+        "-c",
+        action="append",
+        metavar="CITY",
+        help=(
+            "Hebrew locality name to watch for alerts. "
+            "Can be used multiple times or as a comma-separated list. "
+            "When a watched locality is alerted, a full-screen warning is shown. "
+            "Example: -c 'תל אביב - יפו' -c 'ירושלים'"
+        ),
+    )
+    parser.add_argument(
+        "--list-cities",
+        action="store_true",
+        help="Print all known Israeli localities (Hebrew names) and exit.",
+    )
     args = parser.parse_args()
 
     if args.interval < 1:
         print("Error: interval must be at least 1 second.", file=sys.stderr)
         sys.exit(1)
 
+    # ── --list-cities mode ─────────────────────────────────────────────────
+    if args.list_cities:
+        print("Fetching city list from OREF…")
+        city_data = fetch_cities()
+        if not city_data:
+            print("Error: could not fetch city list.", file=sys.stderr)
+            sys.exit(1)
+        print(f"{'Locality':<40}  {'Area':<30}  Shelter (s)")
+        print("-" * 80)
+        for name, info in sorted(city_data.items()):
+            area = info.get("areaname", "")
+            migun = info.get("migun_time", "—")
+            print(f"{name:<40}  {area:<30}  {migun}")
+        sys.exit(0)
+
+    # ── Parse watched cities ───────────────────────────────────────────────
+    watch_cities: list[str] = []
+    if args.cities:
+        for entry in args.cities:
+            watch_cities.extend(c.strip() for c in entry.split(",") if c.strip())
+
     try:
-        run(args.interval)
+        run(args.interval, watch_cities)
     except KeyboardInterrupt:
-        pass  # clean exit on Ctrl-C / q (handled by terminal)
+        pass  # clean exit on Ctrl-C
 
 
 if __name__ == "__main__":

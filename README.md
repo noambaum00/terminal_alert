@@ -32,6 +32,8 @@ After installation the `terminal-alert` command is available system-wide:
 ```bash
 terminal-alert
 terminal-alert --interval 10
+terminal-alert --list-cities               # list all Israeli locality names
+terminal-alert -c 'תל אביב - יפו'         # watch a specific city
 ```
 
 ### pip (manual)
@@ -43,10 +45,18 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Default: poll every 30 seconds
+# Default: poll every 30 seconds (no locality filter)
 python3 alert_watch.py
 
-# Custom interval (e.g. every 10 seconds)
+# Watch for alerts in specific localities — shows a full-screen warning when matched
+python3 alert_watch.py --cities 'תל אביב - יפו' --cities 'ירושלים'
+python3 alert_watch.py -c 'תל אביב - יפו,ירושלים'   # comma-separated also works
+
+# List all available Israeli locality names (Hebrew) so you can find the exact spelling
+python3 alert_watch.py --list-cities
+python3 alert_watch.py --list-cities | grep תל       # filter with grep
+
+# Custom poll interval (e.g. every 10 seconds)
 python3 alert_watch.py --interval 10
 python3 alert_watch.py -i 10
 ```
